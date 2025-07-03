@@ -96,4 +96,54 @@ class BufferPoolManagerTest {
             bufferPoolManager.unpinPage(i);
         }
     }
+
+    @Test
+    void testEvictionPolicy() throws IOException {
+        int poolSize = 10;
+        
+        // Fetch 10 pages to fill the pool
+        Page[] pages = new Page[poolSize];
+        for (int i = 0; i < poolSize; i++) {
+            int pageId = diskManager.allocatePage();
+            pages[i] = bufferPoolManager.fetchPage(pageId);
+            assertNotNull(pages[i]);
+        }
+
+        // Unpin all pages to make them candidates for eviction
+        // The order of unpinning will establish the LRU order.
+        // Page 0 will be the LRU, Page 9 will be the MRU.
+        for (int i = 0; i < poolSize; i++) {
+            assertTrue(bufferPoolManager.unpinPage(i));
+        }
+
+        // Fetch one more page, this should cause an eviction.
+        int newPageId = diskManager.allocatePage(); // pageId = 10
+        Page newPage = bufferPoolManager.fetchPage(newPageId);
+        assertNotNull(newPage, "Should be able to fetch a new page by evicting one.");
+
+        // Check that page 0, the LRU page, was evicted.
+        // Trying to fetch it again should result in a cache miss that reads from disk.
+        // A simple check is to see if it's no longer in the page table internally.
+        // We can't access the pageTable directly, so we'll test by seeing if a new
+        // page can be fetched (which we already did).
+        
+        // A more direct test: Let's fill the pool again. Page 1 should be the next victim.
+        assertTrue(bufferPoolManager.unpinPage(newPageId)); // Unpin page 10
+        
+        int anotherNewPageId = diskManager.allocatePage(); // pageId = 11
+        bufferPoolManager.fetchPage(anotherNewPageId);
+        
+        // At this point, page 0 and page 1 should have been evicted.
+        // Let's try to fetch another 8 pages. The victims should be 2, 3, 4... 9
+        for (int i = 0; i < 8; i++) {
+             assertTrue(bufferPoolManager.unpinPage(11 + i));
+             int victimId = diskManager.allocatePage();
+             assertNotNull(bufferPoolManager.fetchPage(victimId));
+        }
+        
+        // All original pages (0-9) should be evicted by now.
+        // Fetching page 9 should be a miss, requiring a new eviction (page 10).
+        assertTrue(bufferPoolManager.unpinPage(19));
+        assertNotNull(bufferPoolManager.fetchPage(9));
+    }
 }

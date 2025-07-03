@@ -14,6 +14,7 @@ public class BufferPoolManager {
     private final Map<Integer, Integer> pageTable;  // Maps a pageId from disk to its frameId in the pagePool.
     private final Queue<Integer> freeFrames;    // A queue of frameIds that are free to be used.
     private final int[] pinCount;
+    private final LRUReplacer lruReplacer;
 
     /**
      * Creates a new BufferPoolManager.
@@ -28,8 +29,8 @@ public class BufferPoolManager {
 
         this.pageTable = new HashMap<>();
         this.freeFrames = new LinkedList<>();
-
         this.pinCount = new int[poolSize];
+        this.lruReplacer = new LRUReplacer(poolSize);
         // Loop through the pagePool array and create a new Page object for each slot.
         // This pre-allocates the memory for our cache.
         for (int i = 0; i < poolSize; i++) {
@@ -45,49 +46,61 @@ public class BufferPoolManager {
      * Fetches the requested page from the buffer pool.
      * 1. Search the page table for the page.
      * 2. If not found, find a replacement frame from the free list.
-     * 3. If no free frame, return null.
-     * 4. If a frame is found, update the page table, read page from disk, and return it.
+     * 3. If no free frame, then evict a LRU page, and finds its frame.
+     * 4. If a frame is found, update the page table, read page from disk, pin page, and return it.
+     * 5. If a frame is not found, then return null.
      *
      * @param pageId The ID of the page to fetch.
-     * @return The Page object, or null if no free frames are available.
+     * @return The Page object, or null if no free frames, and no unpinned pages in cache are available.
      * @throws IOException if a disk I/O error occurs.
      */
     public Page fetchPage(int pageId) throws IOException {
-        Integer frameId;
-
-        // 1. Check if the page is already in the buffer pool (cache hit).
+        // 1. Check if page is already in the buffer pool (cache hit).
         if (pageTable.containsKey(pageId)) {
-            frameId = pageTable.get(pageId);
-        } else{
-            // 2. If not, it's a cache miss. Find a free frame.
-            //    The poll() method retrieves and removes the head of the queue.
-            frameId = freeFrames.poll();
+            int frameId = pageTable.get(pageId);
+            pinCount[frameId]++;
+            // A page that is fetched is being used, so it's not a candidate for eviction.
+            lruReplacer.pin(pageId);
+            return pagePool[frameId];
+        }
 
-            // 3. If no free frames are available, --- logic is remaining ---.
-            if (frameId == null) {
+        // 2. Cache miss. Find a replacement frame.
+        // First, try to get a frame from the free list.
+        Integer frameId = freeFrames.poll();
+
+        // If the free list is empty, we must evict a page.
+        if (frameId == null) {
+            // Ask the LRUReplacer for a victim page ID.
+            Integer victimPageId = lruReplacer.victim();
+
+            // If victim() returns null, all pages are pinned. We cannot proceed.
+            if (victimPageId == null) {
                 return null;
             }
 
-            // 4. We found a free frame. Now we need to:
-            //    a) Update the page table to map the pageId to our new frameId.
-            pageTable.put(pageId, frameId);
+            // We have the victim's pageId. Now find its frameId using the pageTable.
+            frameId = pageTable.get(victimPageId);
 
-            //    b) Get the actual Page object (the frame) from our pool.
-            //    c) Use the diskManager to read the data from disk into the page's byte array.
-            try {
-                diskManager.readPage(pageId, this.pagePool[frameId]);
-            } catch (IOException e) {
-                // Something went wrong reading from disk! We must revert our state.
-                pageTable.remove(pageId);
-                freeFrames.add(frameId);
-                throw e;
-            }
+            // Important: Remove the old page's mapping from the page table.
+            pageTable.remove(victimPageId);
+            
+            // Note: Will handle dirty pages here later. If the victim page was
+            // modified, we would need to write it to disk before evicting.
         }
 
-        // Increment the pin count for the corresponding frame.
-        ++pinCount[frameId];
+        // 3. We now have a valid frameId to use, either from the free list or eviction.
+        
+        // 4. Update metadata for the new page.
+        pageTable.put(pageId, frameId);
+        pinCount[frameId] = 1;
 
-        return this.pagePool[frameId];
+        // 5. The new page is being used, so tell the replacer to "pin" it
+        lruReplacer.pin(pageId);
+
+        // 6. Read the page data from disk into the frame.
+        diskManager.readPage(pageId, pagePool[frameId]);
+        
+        return pagePool[frameId];
     }
     
     
@@ -113,10 +126,12 @@ public class BufferPoolManager {
         }
 
         // 4. Decrement the pin count for this frame.
-        --pinCount[frameId];
+        pinCount[frameId]--;
 
-        // 5. In the future, if the pin count becomes 0, we will notify our LRUReplacer
-        //    that this page is now a candidate for eviction.
+        // 5. If the pin count is now 0, this page becomes a candidate for eviction.
+        if (pinCount[frameId] == 0) {
+            lruReplacer.unpin(pageId);
+        }
 
         return true;
     }
